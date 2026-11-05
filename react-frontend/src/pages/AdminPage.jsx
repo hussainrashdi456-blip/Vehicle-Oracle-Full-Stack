@@ -4,34 +4,36 @@ import { Users, Car, TrendingUp, ShieldAlert } from 'lucide-react'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts'
 import PageTransition from '../components/layout/PageTransition'
 import { useAuth } from '../context/AuthContext'
-import { formatSpaced } from '../lib/format'
+import { getAdminStats } from '../services/api'
 
 export default function AdminPage() {
   const { user } = useAuth()
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
 
   useEffect(() => {
-    // Agar user login nahi hai ya email admin wali nahi hai, toh rok dein
-    if (!user || user.email !== 'admin@vehicleoracle.com') {
+    // Agar user login nahi hai ya admin nahi hai, toh rok dein
+    if (!user || user.role !== 'admin') {
       setLoading(false)
       return
     }
 
-    fetch('http://localhost:5000/api/admin/stats')
-      .then(res => res.json())
+    // Backend se data fetch karein
+    getAdminStats()
       .then(d => {
         setData(d)
         setLoading(false)
       })
       .catch(err => {
-        console.error(err)
+        console.error("Admin data fetch error:", err)
+        setError("Could not load admin data. Please log out and log in again.")
         setLoading(false)
       })
   }, [user])
 
-  // Agar admin nahi hai
-  if (!user || user.email !== 'admin@vehicleoracle.com') {
+  // Agar user admin nahi hai
+  if (!user || user.role !== 'admin') {
     return (
       <PageTransition>
         <div className="min-h-[70vh] flex flex-col items-center justify-center text-center px-4">
@@ -43,8 +45,21 @@ export default function AdminPage() {
     )
   }
 
+  // Loading state
   if (loading) return <div className="text-center py-20 text-slate-500">Loading Dashboard...</div>
 
+  // Agar data fetch fail ho jaye
+  if (error || !data) {
+    return (
+      <PageTransition>
+        <div className="text-center py-20">
+          <p className="text-rose-500 text-lg mb-4">{error || "Failed to load admin data."}</p>
+        </div>
+      </PageTransition>
+    )
+  }
+
+  // Agar sab kuch theek hai, toh Dashboard dikhayein
   return (
     <PageTransition>
       <div className="max-w-6xl mx-auto px-4 py-12">
@@ -61,7 +76,7 @@ export default function AdminPage() {
             </div>
             <div>
               <p className="text-slate-500 text-sm font-semibold">Total Users</p>
-              <p className="text-3xl font-extrabold text-slate-800">{data.totalUsers}</p>
+              <p className="text-3xl font-extrabold text-slate-800">{data.totalUsers || 0}</p>
             </div>
           </motion.div>
 
@@ -71,7 +86,7 @@ export default function AdminPage() {
             </div>
             <div>
               <p className="text-slate-500 text-sm font-semibold">Listings</p>
-              <p className="text-3xl font-extrabold text-slate-800">{data.totalListings}</p>
+              <p className="text-3xl font-extrabold text-slate-800">{data.totalListings || 0}</p>
             </div>
           </motion.div>
 
@@ -81,7 +96,7 @@ export default function AdminPage() {
             </div>
             <div>
               <p className="text-slate-500 text-sm font-semibold">Predictions</p>
-              <p className="text-3xl font-extrabold text-slate-800">{data.totalPredictions}</p>
+              <p className="text-3xl font-extrabold text-slate-800">{data.totalPredictions || 0}</p>
             </div>
           </motion.div>
         </div>
@@ -92,7 +107,7 @@ export default function AdminPage() {
             <h2 className="text-lg font-bold text-slate-800 mb-6">Top Searched Brands</h2>
             <div className="h-[300px]">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={data.brandStats} layout="vertical" margin={{ left: 20 }}>
+                <BarChart data={data.brandStats || []} layout="vertical" margin={{ left: 20 }}>
                   <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#f1f5f9" />
                   <XAxis type="number" hide />
                   <YAxis dataKey="name" type="category" axisLine={false} tickLine={false} tick={{fill: '#64748b', fontSize: 12, fontWeight: 600}} width={80} />
@@ -107,7 +122,7 @@ export default function AdminPage() {
           <div className="bg-white p-6 rounded-2xl shadow-card border border-slate-100">
             <h2 className="text-lg font-bold text-slate-800 mb-6">Recent Signups</h2>
             <div className="space-y-4">
-              {data.recentUsers.map((u, i) => (
+              {data.recentUsers?.map((u, i) => (
                 <div key={i} className="flex items-center justify-between border-b border-slate-100 pb-3 last:border-0">
                   <div>
                     <p className="font-semibold text-slate-800">{u.name}</p>

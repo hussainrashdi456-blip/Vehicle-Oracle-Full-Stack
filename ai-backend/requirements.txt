@@ -1,1 +1,15 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+pydantic>=2.6
+pandas>=2.0
+numpy
+joblib
+pillow
+ultralytics
 
+# IMPORTANT: pin these two to the exact versions you trained with
+# (run `pip freeze | grep -iE "xgboost|scikit-learn"` in your training env).
+# The .pkl files can fail to load or behave differently on other versions.
+scikit-learn
+xgboost

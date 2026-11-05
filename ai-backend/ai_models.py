@@ -1,143 +1,191 @@
 """
 ai_models.py
 ------------
-AI models ka integration. XGBoost model load karta hai aur price predict karta hai.
-YOLOv8 abhi placeholder hai (baad mein bharenge).
+Model layer for the Vehicle Price Oracle.
+
+* Price prediction: XGBoost regressor, plus the label encoders and feature
+  order that the training pipeline (run_pipeline.py) saved next to it.
+* Damage detection: YOLOv8 weights trained on car-damage images.
+
+Nothing in here knows about HTTP. main.py calls these functions and maps the
+exceptions below to proper status codes.
 """
 
+import logging
 import os
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
 import joblib
-import numpy as np
 import pandas as pd
+import xgboost as xgb
+from PIL import Image
 
-# ---------- PATHS ----------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
+logger = logging.getLogger(__name__)
 
-MODEL_PATH = os.path.join(OUTPUT_DIR, "xgb_car_price_model.pkl")
-ENCODERS_PATH = os.path.join(OUTPUT_DIR, "label_encoders.pkl")
-FEATURES_PATH = os.path.join(OUTPUT_DIR, "feature_columns.pkl")
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "outputs"
 
+MODEL_PATH = OUTPUT_DIR / "xgb_car_price_model.pkl"
+ENCODERS_PATH = OUTPUT_DIR / "label_encoders.pkl"
+FEATURES_PATH = OUTPUT_DIR / "feature_columns.pkl"
 
-# ---------- MODEL LOADING (cached) ----------
-_model = None
-_encoders = None
-_features = None
+# Weights for the damage detector. Set YOLO_WEIGHTS if they live somewhere else.
+DAMAGE_WEIGHTS_PATH = Path(os.getenv("YOLO_WEIGHTS", OUTPUT_DIR / "damage_best.pt"))
 
-
-def _load_artifacts():
-    """Model, encoders, aur features load karein (ek dafa)."""
-    global _model, _encoders, _features
-
-    if _model is None:
-        if not os.path.exists(MODEL_PATH):
-            return False
-        _model = joblib.load(MODEL_PATH)
-        _encoders = joblib.load(ENCODERS_PATH)
-        _features = joblib.load(FEATURES_PATH)
-    return True
+# Car_Age = DATASET_YEAR - model year. The listings were scraped in 2025, so
+# this has to match whatever the training pipeline used. If you retrain with
+# "current year" logic, change it here too, otherwise ages will be off by one.
+DATASET_YEAR = 2025
 
 
-def load_price_model():
-    """Public function — model load karta hai."""
-    if _load_artifacts():
-        return _model
-    return None
+class ModelNotReadyError(RuntimeError):
+    """A model file is missing or its library is not installed."""
 
 
-# ---------- PRICE PREDICTION ----------
-def predict_price(car_details: dict, economic_data: dict = None) -> dict:
+class UnknownCategoryError(ValueError):
+    """The request contains a brand, model, fuel, etc. the model never saw."""
+
+
+@dataclass(frozen=True)
+class PriceModel:
+    regressor: Any
+    encoders: dict
+    feature_names: list
+
+
+@lru_cache(maxsize=1)
+def get_price_model() -> PriceModel:
+    """Load the XGBoost model once and reuse it. Failures are not cached, so the
+    next call retries after you have run the training pipeline."""
+    required = (MODEL_PATH, ENCODERS_PATH, FEATURES_PATH)
+    missing = [path.name for path in required if not path.exists()]
+    if missing:
+        raise ModelNotReadyError(
+            f"Missing model files: {', '.join(missing)}. Run run_pipeline.py first."
+        )
+    return PriceModel(
+        regressor=joblib.load(MODEL_PATH),
+        encoders=joblib.load(ENCODERS_PATH),
+        feature_names=list(joblib.load(FEATURES_PATH)),
+    )
+
+
+def _build_feature_frame(model: PriceModel, car: dict) -> pd.DataFrame:
+    """Turn the request into the one-row frame the model was trained on."""
+    row = {
+        "Brand": car["Brand"],
+        "Model": car["Model"],
+        "Car_Age": max(DATASET_YEAR - int(car["Year"]), 0),
+        "Mileage_Cleaned": float(car["Mileage_Cleaned"]),
+        "Engine_Cleaned": float(car["Engine_Cleaned"]),
+        "Fuel": car["Fuel"],
+        "Transmission": car["Transmission"],
+        "Province": car["Province"],
+        "Body Type": car["Body Type"],
+        "Feature_Count": int(car["Feature_Count"]),
+    }
+
+    for column, encoder in model.encoders.items():
+        if column not in row:
+            continue
+        value = str(row[column])
+        # Encoding an unseen value as 0 would quietly price the car as whichever
+        # label sorts first alphabetically, so we refuse instead.
+        if value not in encoder.classes_:
+            raise UnknownCategoryError(f"'{value}' is not a known value for {column}.")
+        row[column] = int(encoder.transform([value])[0])
+
+    return pd.DataFrame([row])[model.feature_names]
+
+
+def _top_factors(model: PriceModel, features: pd.DataFrame, limit: int = 5) -> list:
+    """Per-prediction SHAP contributions, computed by XGBoost itself.
+
+    Values are in the same units as the price: positive pushes the estimate up,
+    negative pulls it down. The last column XGBoost returns is the bias term,
+    which is not a feature, so it is dropped.
     """
-    Car details se price predict karein.
-
-    INPUT (car_details):
-        - Brand: str (e.g., "Toyota")
-        - Model: str (e.g., "Corolla GLi")
-        - Year: int (e.g., 2015)
-        - Mileage_Cleaned: float (e.g., 50000)
-        - Engine_Cleaned: float (e.g., 1300)
-        - Fuel: str (e.g., "Petrol")
-        - Transmission: str (e.g., "Manual")
-        - Province: str (e.g., "Punjab")
-        - Body Type: str (e.g., "Sedan")
-        - Feature_Count: int (e.g., 5)
-
-    OUTPUT:
-        {"price": float, "explanation": dict}
-    """
-    if not _load_artifacts():
-        return {
-            "price": 0.0,
-            "explanation": {"note": "Model not trained yet. Run run_pipeline.py first."}
-        }
-
     try:
-        # Car age calculate karein
-        current_year = 2025
-        car_age = current_year - int(car_details.get("Year", current_year))
+        booster = model.regressor.get_booster()
+        contributions = booster.predict(xgb.DMatrix(features), pred_contribs=True)[0]
+    except Exception:
+        logger.exception("Could not compute feature contributions")
+        return []
 
-        # Input row banayein (same order jo feature_columns.pkl mein hai)
-        row = {
-            "Brand": car_details.get("Brand", "Unknown"),
-            "Model": car_details.get("Model", "Unknown"),
-            "Car_Age": car_age,
-            "Mileage_Cleaned": float(car_details.get("Mileage_Cleaned", 0)),
-            "Engine_Cleaned": float(car_details.get("Engine_Cleaned", 1000)),
-            "Fuel": car_details.get("Fuel", "Petrol"),
-            "Transmission": car_details.get("Transmission", "Manual"),
-            "Province": car_details.get("Province", "Punjab"),
-            "Body Type": car_details.get("Body Type", "Sedan"),
-            "Feature_Count": int(car_details.get("Feature_Count", 0)),
+    ranked = sorted(
+        zip(model.feature_names, contributions[:-1]),
+        key=lambda pair: abs(pair[1]),
+        reverse=True,
+    )
+    return [
+        {
+            "feature": name,
+            "importance": round(float(value), 2),
+            "direction": "up" if value >= 0 else "down",
         }
-
-        # Categorical columns encode karein
-        for col, encoder in _encoders.items():
-            if col in row:
-                val = str(row[col])
-                # Agar value encoder mein maujood nahi, to default (0) use karein
-                if val in encoder.classes_:
-                    row[col] = encoder.transform([val])[0]
-                else:
-                    row[col] = 0
-
-        # DataFrame banayein (feature order maintain karte hue)
-        X = pd.DataFrame([row])[_features]
-
-        # Predict karein
-        price = float(_model.predict(X)[0])
-
-        # Explainability — feature importance se
-        importance = dict(zip(_features, _model.feature_importances_))
-        top_features = sorted(importance.items(), key=lambda x: x[1], reverse=True)[:5]
-
-        return {
-            "price": price,
-            "explanation": {
-                "top_factors": [
-                    {"feature": f, "importance": round(float(v), 3)}
-                    for f, v in top_features
-                ],
-                "note": "Top features jo price ko sab se zyada affect karte hain"
-            }
-        }
-
-    except Exception as e:
-        return {
-            "price": 0.0,
-            "explanation": {"error": str(e)}
-        }
+        for name, value in ranked[:limit]
+    ]
 
 
-# ---------- DAMAGE DETECTION (placeholder) ----------
-def detect_damage(image) -> dict:
+def predict_price(car: dict) -> dict:
+    """Estimate a used-car price.
+
+    Expected keys in `car`: Brand, Model, Year, Mileage_Cleaned, Engine_Cleaned,
+    Fuel, Transmission, Province, "Body Type", Feature_Count.
+
+    Returns {"price": float, "explanation": {"top_factors": [...], "note": str}}.
+    Raises ModelNotReadyError or UnknownCategoryError; main.py turns those
+    into 503 and 422 responses.
     """
-    YOLOv8 damage detection — ABHI PLACEHOLDER HAI.
-    Baad mein YOLOv8 model integrate karenge.
-    """
+    model = get_price_model()
+    features = _build_feature_frame(model, car)
+    price = float(model.regressor.predict(features)[0])
+
     return {
-        "damage_detected": False,
-        "boxes": [],
-        "severity": "none",
-        "repair_cost": 0.0,
-        "note": "YOLOv8 model not integrated yet"
+        "price": price,
+        "explanation": {
+            "top_factors": _top_factors(model, features),
+            "note": "Features that moved this estimate the most. Positive means it raised the price.",
+        },
+    }
+
+
+@lru_cache(maxsize=1)
+def get_damage_model():
+    """Load the YOLOv8 damage detector once. ultralytics pulls in torch, so the
+    import stays inside the function and the price API still starts without it."""
+    try:
+        from ultralytics import YOLO
+    except ImportError as exc:
+        raise ModelNotReadyError("ultralytics is not installed.") from exc
+
+    if not DAMAGE_WEIGHTS_PATH.exists():
+        raise ModelNotReadyError(f"Damage weights not found at {DAMAGE_WEIGHTS_PATH}.")
+    return YOLO(str(DAMAGE_WEIGHTS_PATH))
+
+
+def detect_damage(image: Image.Image, min_confidence: float = 0.25) -> dict:
+    """Run the damage detector on a PIL image and return boxes in pixel coordinates."""
+    detector = get_damage_model()
+    results = detector.predict(image, conf=min_confidence, verbose=False)
+
+    detections = []
+    for result in results:
+        for box in result.boxes:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            detections.append(
+                {
+                    "label": detector.names[int(box.cls[0])],
+                    "confidence": round(float(box.conf[0]), 2),
+                    "box": [int(x1), int(y1), int(x2), int(y2)],
+                }
+            )
+
+    return {
+        "damage_detected": bool(detections),
+        "detections": detections,
+        "message": f"{len(detections)} damaged region(s) found.",
     }

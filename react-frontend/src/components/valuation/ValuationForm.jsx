@@ -129,11 +129,13 @@ export default function ValuationForm() {
 
       // 2. Agar user login hai, toh History save karein
       if (user) {
-        await fetch('http://localhost:5000/api/save-prediction', {
+        await fetch('http://localhost:5000/api/predictions/save-prediction', { // <-- Sahi Route
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${localStorage.getItem('token')}`
+          },
           body: JSON.stringify({
-            userId: user.id,
             brand: form.brand,
             model: form.model,
             year: Number(form.year),

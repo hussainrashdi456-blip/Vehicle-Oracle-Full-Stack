@@ -1,273 +1,306 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional
-import pandas as pd
+"""
+main.py
+-------
+FastAPI service for the Vehicle Price Oracle: price prediction, market stats
+and damage detection. The Node backend sits in front of this service.
+
+Run with:  uvicorn main:app --port 8000
+"""
+
+import io
+import logging
 import os
+import secrets
+from contextlib import asynccontextmanager
+from functools import lru_cache
+from pathlib import Path
+from typing import Optional
 
-from ai_models import predict_price, _load_artifacts, _model, _encoders, _features
+import pandas as pd
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image, UnidentifiedImageError
+from pydantic import AliasChoices, BaseModel, Field
 
-app = FastAPI()
+from ai_models import (
+    DATASET_YEAR,
+    ModelNotReadyError,
+    UnknownCategoryError,
+    detect_damage,
+    get_damage_model,
+    get_price_model,
+    predict_price,
+)
+
+logger = logging.getLogger(__name__)
+
+BASE_DIR = Path(__file__).resolve().parent
+CSV_PATH = BASE_DIR / "outputs" / "clean_data.csv"
+
+# Comma-separated list, e.g. ALLOWED_ORIGINS=https://oracle.example.com
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+    if origin.strip()
+]
+
+# Optional shared secret between the Node backend and this service. Leave it
+# unset in local development. If the React app calls this service directly,
+# don't set it: a key shipped to the browser is not a secret.
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
+
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
+Image.MAX_IMAGE_PIXELS = 25_000_000  # Pillow rejects anything over twice this
+
+MIN_LISTINGS_PER_BRAND = 10  # keeps one-off listings out of the "priciest brands" chart
+
+
+def require_internal_key(x_api_key: Optional[str] = Header(default=None)) -> None:
+    if INTERNAL_API_KEY and not (x_api_key and secrets.compare_digest(x_api_key, INTERNAL_API_KEY)):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # Load the heavy models up front so the first user request is not the slow one.
+    for name, loader in (("price model", get_price_model), ("damage model", get_damage_model)):
+        try:
+            loader()
+            logger.info("Loaded %s", name)
+        except ModelNotReadyError as exc:
+            logger.warning("%s not loaded: %s", name, exc)
+    yield
+
+
+app = FastAPI(
+    title="Vehicle Price Oracle - AI Service",
+    lifespan=lifespan,
+    dependencies=[Depends(require_internal_key)],
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-API-Key"],
 )
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CSV_PATH = os.path.join(BASE_DIR, "outputs", "clean_data.csv")
+
+# ---------------------------------------------------------------- schemas
 
 class CarDetails(BaseModel):
-    Brand: str
-    Model: str
-    Year: int
-    Mileage_Cleaned: Optional[float] = 0
-    mileage: Optional[float] = 0
-    Engine_Cleaned: Optional[float] = 1000
-    engine: Optional[float] = 1000
-    Fuel: str
-    Transmission: str
-    Province: str
-    Body_Type: Optional[str] = "Sedan"
-    bodyType: Optional[str] = "Sedan"
-    Feature_Count: Optional[int] = 5
-    features: Optional[list] = []
+    """Request body for /predict.
+
+    The React form sends camelCase keys (mileage, engine, bodyType) while the
+    training data uses Mileage_Cleaned and friends. Both spellings are accepted.
+    """
+
+    Brand: str = Field(min_length=1, max_length=60)
+    Model: str = Field(min_length=1, max_length=80)
+    Year: int = Field(ge=1980, le=DATASET_YEAR + 1)
+    Mileage_Cleaned: float = Field(
+        default=0, ge=0, le=1_000_000, validation_alias=AliasChoices("Mileage_Cleaned", "mileage")
+    )
+    Engine_Cleaned: float = Field(
+        default=1000, ge=0, le=10_000, validation_alias=AliasChoices("Engine_Cleaned", "engine")
+    )
+    Fuel: str = Field(min_length=1, max_length=30)
+    Transmission: str = Field(min_length=1, max_length=30)
+    Province: str = Field(min_length=1, max_length=40)
+    Body_Type: str = Field(
+        default="Sedan", max_length=30, validation_alias=AliasChoices("Body_Type", "bodyType")
+    )
+    Feature_Count: Optional[int] = Field(default=None, ge=0, le=60)
+    features: list[str] = Field(default_factory=list, max_length=60)
+
+
+# ---------------------------------------------------------------- dataset
+
+@lru_cache(maxsize=1)
+def load_listings() -> pd.DataFrame:
+    """Read the cleaned CSV once. Restart the server after regenerating it."""
+    if not CSV_PATH.exists():
+        raise FileNotFoundError(CSV_PATH)
+    return pd.read_csv(CSV_PATH)
+
+
+def get_listings() -> pd.DataFrame:
+    try:
+        return load_listings()
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="Listings dataset not found. Run run_pipeline.py first.")
+
+
+def _top_counts(series: pd.Series, limit: int) -> list:
+    return [{"name": str(name), "value": int(count)} for name, count in series.value_counts().head(limit).items()]
+
+
+# ---------------------------------------------------------------- routes
 
 @app.post("/predict")
-def get_price(car: CarDetails):
-    data = car.dict()
-    
-    details_dict = {
-        "Brand": data["Brand"],
-        "Model": data["Model"],
-        "Year": data["Year"],
-        "Mileage_Cleaned": data.get("Mileage_Cleaned") or data.get("mileage") or 0,
-        "Engine_Cleaned": data.get("Engine_Cleaned") or data.get("engine") or 1000,
-        "Fuel": data["Fuel"],
-        "Transmission": data["Transmission"],
-        "Province": data["Province"],
-        "Body Type": data.get("Body_Type") or data.get("bodyType") or "Sedan",
-        "Feature_Count": data.get("Feature_Count") or len(data.get("features", [])) or 5
+def predict(car: CarDetails):
+    # An explicit Feature_Count wins; otherwise count the ticked features; 5 is the old default.
+    feature_count = car.Feature_Count if car.Feature_Count is not None else (len(car.features) or 5)
+
+    details = {
+        "Brand": car.Brand,
+        "Model": car.Model,
+        "Year": car.Year,
+        "Mileage_Cleaned": car.Mileage_Cleaned,
+        "Engine_Cleaned": car.Engine_Cleaned,
+        "Fuel": car.Fuel,
+        "Transmission": car.Transmission,
+        "Province": car.Province,
+        "Body Type": car.Body_Type,
+        "Feature_Count": feature_count,
     }
-    
-    result = predict_price(details_dict)
-    
-    # --- Dynamic Feature Impact ---
+
     try:
-        if _load_artifacts():
-            # Input row banayein
-            row = {
-                "Brand": details_dict["Brand"], "Model": details_dict["Model"],
-                "Car_Age": 2025 - int(details_dict["Year"]),
-                "Mileage_Cleaned": float(details_dict["Mileage_Cleaned"]),
-                "Engine_Cleaned": float(details_dict["Engine_Cleaned"]),
-                "Fuel": details_dict["Fuel"], "Transmission": details_dict["Transmission"],
-                "Province": details_dict["Province"], "Body Type": details_dict["Body Type"],
-                "Feature_Count": int(details_dict["Feature_Count"])
-            }
-            
-            for col, encoder in _encoders.items():
-                if col in row:
-                    val = str(row[col])
-                    row[col] = encoder.transform([val])[0] if val in encoder.classes_ else 0
-                    
-            X_single = pd.DataFrame([row])[_features]
-            base_price = result["price"]
-            
-            feature_impacts = []
-            for feature in _features:
-                X_modified = X_single.copy()
-                
-                # Agar numeric feature hai (Age, Mileage, Engine, Features)
-                if feature in ["Car_Age", "Mileage_Cleaned", "Engine_Cleaned", "Feature_Count"]:
-                    # Agar value 0 hai toh usay 1 kar dein taake calculate ho sake
-                    val = X_modified[feature].values[0]
-                    if val == 0:
-                        X_modified[feature] = 1
-                    else:
-                        X_modified[feature] = val * 1.1 # 10% barhayein
-                else:
-                    # Categorical feature: Hum current value ko 0 kar ke dekhte hain ke price par kya asar hota hai
-                    # (Kyunke 0 aksar "Unknown" hota hai)
-                    X_modified[feature] = 0
-                
-                new_price = _model.predict(X_modified)[0]
-                impact = (base_price - new_price) # Asar kitna hai
-                
-                if abs(impact) > 5000: # 5000 se kam asar ignore karein
-                    feature_impacts.append((feature, impact))
-            
-            # Agar list khali hai, toh fallback global importance use karein
-            if not feature_impacts:
-                feature_impacts = [(f, v * base_price * 0.2) for f, v in zip(_features, _model.feature_importances_)]
-            
-            feature_impacts.sort(key=lambda x: abs(x[1]), reverse=True)
-            
-            result["explanation"]["top_factors"] = [
-                {"feature": f, "importance": round(float(v), 2)} for f, v in feature_impacts[:5]
-            ]
-    except Exception as e:
-        print("Feature Importance Error:", e)
-        
-    return result
+        return predict_price(details)
+    except ModelNotReadyError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except UnknownCategoryError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception:
+        logger.exception("Price prediction failed")
+        raise HTTPException(status_code=500, detail="Price prediction failed.")
+
 
 @app.get("/api/stats")
 def get_stats():
-    if not os.path.exists(CSV_PATH):
-        return {"total_cars": 0, "avg_price": 0, "brands": 0, "models": 0, "error": "CSV not found"}
-    df = pd.read_csv(CSV_PATH)
+    listings = get_listings()
+    mean_price = listings["Price_Cleaned"].mean()
     return {
-        "total_cars": int(len(df)),
-        "avg_price": int(df["Price_Cleaned"].mean()),
-        "brands": int(df["Brand"].nunique()),
-        "models": int(df["Model"].nunique())
+        "total_cars": int(len(listings)),
+        "avg_price": int(mean_price) if pd.notna(mean_price) else 0,
+        "brands": int(listings["Brand"].nunique()),
+        "models": int(listings["Model"].nunique()),
     }
+
+
+@lru_cache(maxsize=1)
+def _build_car_options() -> dict:
+    listings = load_listings()
+    brand_models = {
+        brand: sorted(group["Model"].dropna().unique().tolist())
+        for brand, group in listings.groupby("Brand")
+    }
+    return {
+        "brand_models": brand_models,
+        "provinces": sorted(listings["Province"].dropna().unique().tolist()),
+        "body_types": sorted(listings["Body Type"].dropna().unique().tolist()),
+        "fuels": sorted(listings["Fuel"].dropna().unique().tolist()),
+        "transmissions": sorted(listings["Transmission"].dropna().unique().tolist()),
+    }
+
 
 @app.get("/api/car-options")
 def get_car_options():
-    if not os.path.exists(CSV_PATH):
-        return {"error": "CSV not found"}
-    df = pd.read_csv(CSV_PATH)
-    brand_models = {}
-    for brand, group in df.groupby("Brand"):
-        brand_models[brand] = sorted(group["Model"].dropna().unique().tolist())
-    return {
-        "brand_models": brand_models,
-        "provinces": sorted(df["Province"].dropna().unique().tolist()),
-        "body_types": sorted(df["Body Type"].dropna().unique().tolist()),
-        "fuels": sorted(df["Fuel"].dropna().unique().tolist()),
-        "transmissions": sorted(df["Transmission"].dropna().unique().tolist()),
-    }
+    get_listings()  # turns a missing CSV into a clean 503
+    return _build_car_options()
+
 
 @app.get("/api/car-details")
-def get_car_details(brand: str, model: str):
-    if not os.path.exists(CSV_PATH):
-        return {}
-    df = pd.read_csv(CSV_PATH)
-    car_data = df[(df["Brand"] == brand) & (df["Model"] == model)]
-    
-    if car_data.empty:
-        return {}
-        
+def get_car_details(
+    brand: str = Query(min_length=1, max_length=60),
+    model: str = Query(min_length=1, max_length=80),
+):
+    listings = get_listings()
+    matches = listings[(listings["Brand"] == brand) & (listings["Model"] == model)]
+    if matches.empty:
+        return {}  # the form treats "no match" as "nothing to autofill"
+
+    median_engine = matches["Engine_Cleaned"].median()
+    common_body_types = matches["Body Type"].mode()
     return {
-        "engine": int(round(car_data["Engine_Cleaned"].median() / 50) * 50) if not pd.isna(car_data["Engine_Cleaned"].median()) else 1300,
-        "bodyType": str(car_data["Body Type"].mode().iloc[0]) if not car_data["Body Type"].mode().empty else "Sedan",
-        "available_body_types": sorted(car_data["Body Type"].dropna().unique().tolist()),
-        "available_fuels": sorted(car_data["Fuel"].dropna().unique().tolist()),
-        "available_transmissions": sorted(car_data["Transmission"].dropna().unique().tolist())
+        "engine": int(round(median_engine / 50) * 50) if pd.notna(median_engine) else 1300,
+        "bodyType": str(common_body_types.iloc[0]) if not common_body_types.empty else "Sedan",
+        "available_body_types": sorted(matches["Body Type"].dropna().unique().tolist()),
+        "available_fuels": sorted(matches["Fuel"].dropna().unique().tolist()),
+        "available_transmissions": sorted(matches["Transmission"].dropna().unique().tolist()),
     }
 
 
-from fastapi import File, UploadFile
-from PIL import Image
-import io
-from ultralytics import YOLO
-
-# Model ko ek dafa load karein (server start hote waqt)
-yolo_model = YOLO("yolov8n.pt") # 'n' ka matlab Nano (fast aur light hai)
-
 @app.post("/api/detect-damage")
-async def detect_damage(file: UploadFile = File(...)):
+async def detect_damage_route(file: UploadFile = File(...)):
+    # content_type is whatever the client claims; Pillow decoding below is the real check.
+    if file.content_type not in ALLOWED_IMAGE_TYPES:
+        raise HTTPException(status_code=415, detail="Only JPEG, PNG or WebP images are accepted.")
+
+    raw = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Image must be smaller than 5 MB.")
+
     try:
-        # 1. Image ko read karein
-        contents = await file.read()
-        image = Image.open(io.BytesIO(contents)).convert("RGB")
-        
-        # 2. AI Model se detect karein
-        results = yolo_model(image)
-        
-        detections = []
-        # 3. Result ko format karein jo React samajh sake
-        for r in results:
-            for box in r.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                confidence = float(box.conf[0])
-                class_id = int(box.cls[0])
-                class_name = yolo_model.names[class_id]
-                
-                detections.append({
-                    "label": class_name,
-                    "confidence": round(confidence, 2),
-                    "box": [int(x1), int(y1), int(x2), int(y2)]
-                })
-                
-        return {
-            "damage_detected": len(detections) > 0,
-            "detections": detections,
-            "message": f"{len(detections)} objects detected."
-        }
-    except Exception as e:
-        return {"error": str(e)}
+        image = Image.open(io.BytesIO(raw))
+        image.load()
+        image = image.convert("RGB")
+    except (UnidentifiedImageError, Image.DecompressionBombError, OSError):
+        raise HTTPException(status_code=400, detail="That file could not be read as an image.")
+
+    try:
+        # YOLO inference is CPU-bound; keep it off the event loop.
+        return await run_in_threadpool(detect_damage, image)
+    except ModelNotReadyError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception:
+        logger.exception("Damage detection failed")
+        raise HTTPException(status_code=500, detail="Damage detection failed.")
+
+
+@lru_cache(maxsize=1)
+def _build_trends() -> dict:
+    listings = load_listings()
+    priced = listings.dropna(subset=["Price_Cleaned"])
+
+    avg_by_year = priced.groupby("Year")["Price_Cleaned"].mean()
+    avg_by_year = avg_by_year[avg_by_year.index >= 2010]
+
+    brand_sizes = priced["Brand"].value_counts()
+    established = priced[priced["Brand"].isin(brand_sizes[brand_sizes >= MIN_LISTINGS_PER_BRAND].index)]
+    if established.empty:  # tiny dataset: don't return an empty chart
+        established = priced
+    priciest_brands = established.groupby("Brand")["Price_Cleaned"].mean().nlargest(5)
+
+    return {
+        "year_trend": [{"year": int(year), "avgPrice": int(price)} for year, price in avg_by_year.items()],
+        "brand_trend": [{"brand": brand, "avgPrice": int(price)} for brand, price in priciest_brands.items()],
+        "body_types": _top_counts(listings["Body Type"], 6),
+        "provinces": _top_counts(listings["Province"], 5),
+    }
 
 
 @app.get("/api/trends")
 def get_trends():
-    if not os.path.exists(CSV_PATH):
-        return {"error": "CSV not found"}
-    
-    df = pd.read_csv(CSV_PATH)
-    
-    # 1. Har saal ki average price (Year vs Price)
-    year_price = df.groupby("Year")["Price_Cleaned"].mean().reset_index()
-    year_price = year_price[year_price["Year"] >= 2010] # 2010 se aage ka data
-    year_data = [
-        {"year": int(row["Year"]), "avgPrice": int(row["Price_Cleaned"])} 
-        for _, row in year_price.iterrows()
-    ]
-    
-    # 2. Top 5 Brands ki average price (Brand vs Price)
-    brand_price = df.groupby("Brand")["Price_Cleaned"].mean().sort_values(ascending=False).head(5).reset_index()
-    brand_data = [
-        {"brand": row["Brand"], "avgPrice": int(row["Price_Cleaned"])} 
-        for _, row in brand_price.iterrows()
-    ]
-    
-    # 3. Body Type ka count (Kaunsi body type zyada hai)
-    body_count = df["Body Type"].value_counts().head(6).reset_index()
-    body_data = [
-        {"name": row["Body Type"], "value": int(row["count"])} 
-        for _, row in body_count.iterrows()
-    ]
-    
-    # 4. Provinces ka count
-    province_count = df["Province"].value_counts().head(5).reset_index()
-    province_data = [
-        {"name": row["Province"], "value": int(row["count"])} 
-        for _, row in province_count.iterrows()
-    ]
-    
-    return {
-        "year_trend": year_data,
-        "brand_trend": brand_data,
-        "body_types": body_data,
-        "provinces": province_data
-    }
+    get_listings()
+    return _build_trends()
 
 
 @app.get("/api/market-comparison")
-def get_market_comparison(brand: str, model: str, year: int):
-    if not os.path.exists(CSV_PATH):
-        return {"error": "Data not found"}
-    
-    df = pd.read_csv(CSV_PATH)
-    
-    # Similar gaariyan dhoondein (Same Brand, Model, aur Year +- 2 saal)
-    similar = df[(df["Brand"] == brand) & 
-                 (df["Model"] == model) & 
-                 (df["Year"].between(year - 2, year + 2))]
-    
-    if similar.empty:
-        # Agar exact match na mile, toh sirf Brand aur Year se dhoondein
-        similar = df[(df["Brand"] == brand) & (df["Year"].between(year - 2, year + 2))]
-        
-    if similar.empty:
-        return {"average_price": None, "listings_found": 0}
-        
+def get_market_comparison(
+    brand: str = Query(min_length=1, max_length=60),
+    model: str = Query(min_length=1, max_length=80),
+    year: int = Query(ge=1980, le=DATASET_YEAR + 1),
+):
+    priced = get_listings().dropna(subset=["Price_Cleaned"])
+    near_year = priced["Year"].between(year - 2, year + 2)
+
+    comparable = priced[(priced["Brand"] == brand) & (priced["Model"] == model) & near_year]
+    match_level = "model"
+    if comparable.empty:
+        # No exact model within +/- 2 years, so widen to the whole brand.
+        comparable = priced[(priced["Brand"] == brand) & near_year]
+        match_level = "brand"
+
+    if comparable.empty:
+        return {"average_price": None, "listings_found": 0, "match_level": None}
+
     return {
-        "average_price": int(similar["Price_Cleaned"].mean()),
-        "min_price": int(similar["Price_Cleaned"].min()),
-        "max_price": int(similar["Price_Cleaned"].max()),
-        "listings_found": len(similar)
+        "average_price": int(comparable["Price_Cleaned"].mean()),
+        "min_price": int(comparable["Price_Cleaned"].min()),
+        "max_price": int(comparable["Price_Cleaned"].max()),
+        "listings_found": int(len(comparable)),
+        "match_level": match_level,
     }

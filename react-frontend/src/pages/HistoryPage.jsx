@@ -4,26 +4,39 @@ import { useNavigate } from 'react-router-dom';
 import { Clock } from 'lucide-react';
 import { formatSpaced } from '../lib/format';
 import PageTransition from '../components/layout/PageTransition';
+import { getHistory } from '../services/api';
 
 export default function HistoryPage() {
   const { user } = useAuth();
+  const token = localStorage.getItem('token');
   const navigate = useNavigate();
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    if (!user) {
-      navigate('/login');
-      return;
-    }
-    
-    fetch(`http://localhost:5000/api/history/${user.id}`)
-      .then(res => res.json())
-      .then(data => {
-        setHistory(data);
-        setLoading(false);
+      if (!user || !token) {
+        navigate('/login');
+        return;
+      }
+      
+      // Yahan direct URL use karein
+      fetch(`http://localhost:5000/api/predictions/history/${user.id}`, {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
       })
-      .catch(err => console.log(err));
+        .then(res => {
+          if (!res.ok) throw new Error("Failed to fetch history");
+          return res.json();
+        })
+        .then(data => {
+          setHistory(data);
+          setLoading(false);
+        })
+        .catch(err => {
+          console.error(err);
+          setLoading(false);
+        });
   }, [user, navigate]);
 
   if (loading) return <div className="text-center py-20 text-slate-500">Loading history...</div>;
@@ -44,7 +57,7 @@ export default function HistoryPage() {
               <div key={item._id} className="bg-white p-6 rounded-2xl shadow-card flex justify-between items-center border-l-4 border-sky-500">
                 <div>
                   <h3 className="font-bold text-lg text-slate-800">{item.brand} {item.model}</h3>
-                  <p className="text-slate-500 text-sm">{item.year} • {item.details.Mileage_Cleaned ? formatSpaced(item.details.Mileage_Cleaned) : 0} km • {item.details.Province}</p>
+                  <p className="text-slate-500 text-sm">{item.year} • {item.details?.Mileage_Cleaned ? formatSpaced(item.details.Mileage_Cleaned) : 0} km • {item.details?.Province}</p>
                   <p className="text-xs text-slate-400 mt-2">Saved on {new Date(item.createdAt).toLocaleDateString()}</p>
                 </div>
                 <div className="text-right">

@@ -3,33 +3,35 @@ import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { motion } from 'framer-motion';
 import PageTransition from '../components/layout/PageTransition';
+import { loginUser, signupUser } from '../services/api'; // Naye functions
 
 export default function LoginPage() {
   const [isLogin, setIsLogin] = useState(true);
   const [formData, setFormData] = useState({ name: '', email: '', password: '' });
   const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
   const { login } = useAuth();
   const navigate = useNavigate();
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
-    const endpoint = isLogin ? '/api/auth/login' : '/api/auth/signup';
+    setLoading(true);
     
     try {
-      const res = await fetch(`http://localhost:5000${endpoint}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(formData)
-      });
-      const data = await res.json();
-      
-      if (!res.ok) throw new Error(data.error);
+      let data;
+      if (isLogin) {
+        data = await loginUser({ email: formData.email, password: formData.password });
+      } else {
+        data = await signupUser(formData);
+      }
       
       login(data.user, data.token);
-      navigate('/'); // Login ke baad home par bhej dein
+      navigate('/');
     } catch (err) {
       setError(err.message);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -56,8 +58,8 @@ export default function LoginPage() {
               className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-sky-500 outline-none"
               onChange={(e) => setFormData({...formData, password: e.target.value})} />
               
-            <button type="submit" className="w-full bg-sky-500 hover:bg-sky-600 text-white font-bold py-3 rounded-lg transition-colors">
-              {isLogin ? 'Login' : 'Sign Up'}
+            <button type="submit" disabled={loading} className="w-full bg-sky-500 hover:bg-sky-600 text-white font-bold py-3 rounded-lg transition-colors disabled:opacity-50">
+              {loading ? 'Please wait...' : (isLogin ? 'Login' : 'Sign Up')}
             </button>
           </form>
           

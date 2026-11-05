@@ -10,6 +10,7 @@ const Listing = require('./models/Listing');
 const path = require('path');
 const fs = require('fs');
 const User = require('./models/User');
+const { requireAuth } = require('./middleware/auth');
 require('dotenv').config();
 
 const app = express();
@@ -25,22 +26,32 @@ mongoose.connect(process.env.MONGO_URI)
 app.use('/api/auth', authRoutes);
 
 // Prediction History Routes
-app.post('/api/save-prediction', async (req, res) => {
+app.post('/api/predictions/save-prediction', requireAuth, async (req, res) => {
     try {
-        const { userId, brand, model, year, price, details } = req.body;
-        if (!userId) return res.status(400).json({ error: "User not logged in" });
+        const { brand, model, year, price, details } = req.body;
         
-        const newPrediction = new Prediction({ userId, brand, model, year, price, details });
+        const newPrediction = new Prediction({ 
+            userId: req.user.id, // Token se userId le rahe hain
+            brand, 
+            model, 
+            year, 
+            price, 
+            details 
+        });
         await newPrediction.save();
-        res.json({ success: true });
+        res.status(201).json({ success: true });
     } catch (err) {
+        console.error(err);
         res.status(500).json({ error: "Failed to save history" });
     }
 });
 
-app.get('/api/history/:userId', async (req, res) => {
+app.get('/api/predictions/history/:userId', requireAuth, async (req, res) => {
     try {
-        const history = await Prediction.find({ userId: req.params.userId }).sort({ createdAt: -1 });
+        if (req.params.userId !== req.user.id) {
+            return res.status(403).json({ error: 'You can only view your own history.' });
+        }
+        const history = await Prediction.find({ userId: req.user.id }).sort({ createdAt: -1 });
         res.json(history);
     } catch (err) {
         res.status(500).json({ error: "Failed to fetch history" });

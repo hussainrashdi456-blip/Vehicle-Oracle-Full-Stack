@@ -37,10 +37,10 @@ export default function Navbar() {
           </span>
         </Link>
 
-        {user?.email === 'admin@vehicleoracle.com' && (
-             <li>
-                <NavLink to="/admin" className="...">Admin</NavLink>
-            </li>
+        {user?.role === 'admin' && (
+          <li>
+              <NavLink to="/admin">Admin</NavLink>
+          </li>
         )}
 
         <ul className="hidden items-center gap-1 md:flex">
